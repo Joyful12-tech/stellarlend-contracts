@@ -67,6 +67,8 @@ mod liquidate_close_factor_test;
 #[cfg(test)]
 mod liquidate_event_test;
 #[cfg(test)]
+mod flash_loan_event_test;
+#[cfg(test)]
 mod liquidate_perf_test;
 #[cfg(test)]
 mod liquidate_rounding_test;
@@ -282,6 +284,40 @@ pub struct BadDebtWrittenOffEvent {
     pub socialized: i128,
 }
 
+/// Emitted by [`LendingContract::flash_loan`] when a flash loan is successfully
+/// issued to a receiver callback.
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlashLoanEventV1 {
+    /// Schema version for safe decoding across upgrades.
+    pub schema_version: u32,
+    /// Address that initiated the flash loan.
+    pub initiator: Address,
+    /// Address of the receiver contract that received the funds.
+    pub receiver: Address,
+    /// Asset transferred in the flash loan.
+    pub asset: Address,
+    /// Principal amount loaned.
+    pub amount: i128,
+    /// Fee charged for the flash loan (in asset units).
+    pub fee: i128,
+}
+
+/// Emitted by [`LendingContract::repay_flash_loan`] when flash-loan funds are
+/// successfully returned to the treasury.
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlashLoanRepaidEventV1 {
+    /// Schema version for safe decoding across upgrades.
+    pub schema_version: u32,
+    /// Address that repaid the flash loan.
+    pub payer: Address,
+    /// Asset repaid.
+    pub asset: Address,
+    /// Amount repaid (principal + fee).
+    pub amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmergencyState {
@@ -338,9 +374,7 @@ pub enum LendingError {
     InvalidFeeBps = 2005,
     InvalidFlashUtilizationBps = 2006,
     InsufficientCollateral = 2007,
-    SelfLiquidation = 2008,
     IsolationCeilingExceeded = 2009,
-    InvalidIsolationCeiling = 2010,
     InvalidLiquidationParams = 2011,
     InvalidOracleSignature = 5001,
     PriceOutOfBounds = 3004,
@@ -1741,6 +1775,14 @@ impl LendingContract {
             .checked_add(amount)
             .expect("repay_flash_loan: treasury balance overflow");
         env.storage().persistent().set(&tre_key, &new_tre_bal);
+
+        FlashLoanRepaidEventV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            payer: payer.clone(),
+            asset: asset.clone(),
+            amount,
+        }
+        .publish(&env);
     }
 
     /// Issue a callback-based flash loan.
@@ -1822,6 +1864,16 @@ impl LendingContract {
         if final_tre < required_balance {
             panic!("InsufficientRepayment");
         }
+
+        FlashLoanEventV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            initiator: initiator.clone(),
+            receiver: receiver.clone(),
+            asset: asset.clone(),
+            amount,
+            fee,
+        }
+        .publish(&env);
     }
 
     pub fn get_position(env: Env, user: Address) -> PositionSummary {
@@ -2307,18 +2359,6 @@ impl LendingContract {
     /// Initialize timelocked multisig upgrade governance (admin-only, once).
     pub fn upgrade_init(
         env: Env,
-        initiator: Address,
-        receiver: Address,
-        asset: Address,
-        amount: i128,
-        params: Bytes,
-    ) {
-        check_emergency_status(&env, ProtocolAction::FlashLoan);
-        let tre_key = DataKey::Treasury(asset.clone());
-        let tre_bal: i128 = env.storage().persistent().get(&tre_key).unwrap_or(0);
-        if amount > tre_bal {
-            panic!("InsufficientLiquidity");
-        }
         caller: Address,
         current_wasm_hash: BytesN<32>,
         required_approvals: u32,
